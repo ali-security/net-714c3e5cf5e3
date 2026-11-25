@@ -1,0 +1,100 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated top-level Go test names to run instead of the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # go.mod declares `go 1.24.0`, but the http2 client/server tests
+          # (transport_test.go etc.) are `//go:build go1.25 || goexperiment.synctest`;
+          # Go 1.25 was the current release when v0.45.0 shipped.
+          go-version: "1.25.x"
+          cache: false
+
+      - name: Build module zip
+        run: |
+          set -eo pipefail
+          # Copy the module tree without this workflow (upstream ships no .github)
+          # so the zip keeps the proxy's exact member set.
+          MODSRC="$RUNNER_TEMP/modsrc"
+          mkdir -p "$MODSRC"
+          tar --exclude=./.git --exclude=./.github -cf - . | tar -xf - -C "$MODSRC"
+          HELPER="$RUNNER_TEMP/zipper"
+          mkdir -p "$HELPER" "$RUNNER_TEMP/build_output"
+          cat > "$HELPER/main.go" <<'EOF'
+          package main
+
+          import (
+          	"log"
+          	"os"
+
+          	"golang.org/x/mod/module"
+          	"golang.org/x/mod/zip"
+          )
+
+          func main() {
+          	m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+          	f, err := os.Create(os.Args[4])
+          	if err != nil {
+          		log.Fatal(err)
+          	}
+          	defer f.Close()
+          	if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+          		log.Fatal(err)
+          	}
+          	log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$HELPER"
+          go mod init example.com/zipper
+          go get golang.org/x/mod@v0.28.0
+          go run . golang.org/x/net v0.45.0 "$MODSRC" "$RUNNER_TEMP/build_output/v0.45.0.zip"
+          unzip -l "$RUNNER_TEMP/build_output/v0.45.0.zip" | tail -1
+
+      - name: Build
+        run: |
+          go version
+          go build ./...
+
+      - name: Enable unprivileged ICMP sockets for icmp tests
+        run: |
+          # icmp.TestConcurrentNonPrivilegedListenPacket needs ping sockets, which
+          # the runner's default net.ipv4.ping_group_range disallows.
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+
+      - name: Test
+        run: |
+          set -o pipefail
+          FILTER="${{ inputs.test-filter }}"
+          if [ -n "$FILTER" ]; then
+            go test -v -run "^($(echo "$FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in $FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log" || { echo "selected test $t did not run"; exit 1; }
+            done
+          else
+            go test -v ./... 2>&1 | tee "$RUNNER_TEMP/full.log"
+            echo "===== SKIPPED TESTS (name: reason) ====="
+            # go test -v prints the t.Skip reason ("file_test.go:N: msg") before "--- SKIP".
+            awk '/^[[:space:]]*[A-Za-z0-9_]+\.go:[0-9]+: / { r=$0; sub(/^[[:space:]]+/, "", r); prev=r; next } /^[[:space:]]*--- SKIP:/ { print $3 ": " prev }' "$RUNNER_TEMP/full.log" | sort | uniq | head -300
+            echo "===== FAILED PACKAGES ====="
+            grep -E '^(FAIL|ok)[[:space:]]' "$RUNNER_TEMP/full.log" | grep '^FAIL' || echo "none"
+            echo "TEST SUMMARY: $(grep -cE '^[[:space:]]*--- PASS' "$RUNNER_TEMP/full.log") passed (incl. subtests), $(grep -c '^--- PASS' "$RUNNER_TEMP/full.log") top-level passed, $(grep -cE '^[[:space:]]*--- FAIL' "$RUNNER_TEMP/full.log") failed, $(grep -cE '^[[:space:]]*--- SKIP' "$RUNNER_TEMP/full.log") skipped; packages ok: $(grep -c '^ok' "$RUNNER_TEMP/full.log")"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: go-module-zip
+          path: ${{ runner.temp }}/build_output/v0.45.0.zip
+          if-no-files-found: error
